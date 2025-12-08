@@ -8,6 +8,9 @@
     install_user: "{{ ansible_user_id }}"
     lme_install_dir: "/opt/lme"
     
+    # Safety backup timestamp - set once and used throughout
+    safety_backup_timestamp: "{{ ansible_date_time.year }}-{{ ansible_date_time.month }}-{{ ansible_date_time.day }}_{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+    
   tasks:
     - name: Determine podman command location
       shell: |
@@ -61,6 +64,12 @@
       debug:
         msg: "Using podman from: {{ podman_cmd }}"
 
+    - name: Include SELinux variable setup
+      include_role:
+        name: base
+        tasks_from: selinux_vars.yml
+      tags: selinux
+
     - name: Get Podman graphroot location
       shell: |
         # Get the full path to the storage directory
@@ -83,7 +92,7 @@
     - name: Get list of available backups
       find:
         paths: "{{ backup_base_dir }}/backups"
-        patterns: "20*"
+        patterns: ["20*", "2[0-9][0-9][0-9]-*"]
         file_type: directory
       register: available_backups
       
@@ -91,9 +100,9 @@
       debug:
         msg: "Found {{ available_backups.files | length }} backups in {{ backup_base_dir }}/backups"
         
-    - name: Create backup paths list
+    - name: Create backup paths list sorted by file timestamp (oldest first, newest at bottom)
       set_fact:
-        backup_paths: "{{ available_backups.files | sort(attribute='path') | map(attribute='path') | list }}"
+        backup_paths: "{{ available_backups.files | sort(attribute='mtime') | map(attribute='path') | list }}"
 
     - name: Check if any backups are available
       fail:
@@ -262,11 +271,11 @@
       
     - name: Create rollback status file
       copy:
-        dest: "/tmp/lme_rollback_{{ ansible_date_time.iso8601_basic_short }}.status"
+        dest: "/tmp/lme_rollback_{{ safety_backup_timestamp }}.status"
         content: |
           Rollback started: {{ ansible_date_time.iso8601 }}
           {% if backup_choice in ['y', 'yes'] %}
-          Safety backup created at: {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}
+          Safety backup created at: {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}
           {% else %}
           Safety backup: SKIPPED by user choice
           {% endif %}
@@ -277,13 +286,13 @@
       shell: |
         # Restore LME installation
         mkdir -p {{ lme_install_dir }}
-        cp -a {{ selected_backup_dir }}/lme/. {{ lme_install_dir }}/
+        {{ cp_preserve_cmd }} {{ selected_backup_dir }}/lme/. {{ lme_install_dir }}/
         LME_RESTORE_STATUS=$?
         
         # Restore vault files if they exist in backup
         if [ -d "{{ selected_backup_dir }}/etc_lme" ]; then
           mkdir -p /etc/lme
-          cp -af {{ selected_backup_dir }}/etc_lme/. /etc/lme/
+          {{ cp_preserve_cmd }} -f {{ selected_backup_dir }}/etc_lme/. /etc/lme/
           VAULT_RESTORE_STATUS=$?
           
           # Ensure proper permissions on restored vault files
@@ -302,7 +311,7 @@
         # Restore systemd container files if they exist in backup
         if [ -d "{{ selected_backup_dir }}/etc_containers_systemd" ]; then
           mkdir -p /etc/containers/systemd
-          cp -af {{ selected_backup_dir }}/etc_containers_systemd/. /etc/containers/systemd/
+          {{ cp_preserve_cmd }} -f {{ selected_backup_dir }}/etc_containers_systemd/. /etc/containers/systemd/
           SYSTEMD_RESTORE_STATUS=$?
           
           # Ensure proper permissions on restored systemd files
@@ -328,6 +337,16 @@
         executable: /bin/bash
       when: backup_stat.stat.exists
       register: restore_result
+
+    - name: Restore SELinux contexts for restored paths
+      command: restorecon -Rv "{{ item }}"
+      loop:
+        - "{{ lme_install_dir }}"
+        - "/etc/lme"
+        - "/etc/containers/systemd"
+      when:
+        - selinux_active | default(false)
+      changed_when: false
       
     - name: Reload systemd daemon after restoring systemd files
       systemd:
@@ -576,7 +595,7 @@
             
             if [ -d "$BACKUP_DIR" ]; then
               # Copy the backup data to the volume
-              cp -a "$BACKUP_DIR/." "$VOLUME_PATH/"
+              {{ cp_preserve_cmd }} "$BACKUP_DIR/." "$VOLUME_PATH/"
               if [ $? -eq 0 ]; then
                 echo "Restored {{ item.item }} to ${VOLUME_PATH}"
                 exit 0
@@ -592,6 +611,17 @@
             executable: /bin/bash
           loop: "{{ volume_paths.results }}"
           register: volume_restore_result
+
+        - name: Restore SELinux contexts for volumes
+          shell: |
+            VOLUME_PATH=$({{ podman_cmd }} volume inspect "{{ item }}" --format "{{ '{{' }}.Mountpoint{{ '}}' }}")
+            restorecon -Rv "$VOLUME_PATH"
+          args:
+            executable: /bin/bash
+          loop: "{{ volume_names }}"
+          when:
+            - selinux_active | default(false)
+          changed_when: false
 
         - name: Set volume list for verification
           set_fact:
@@ -679,11 +709,11 @@
 
         - name: Update status to post-volume-restore
           copy:
-            dest: "/tmp/lme_rollback_{{ ansible_date_time.iso8601_basic_short }}.status"
+            dest: "/tmp/lme_rollback_{{ safety_backup_timestamp }}.status"
             content: |
               Rollback started: {{ ansible_date_time.iso8601 }}
               {% if backup_choice in ['y', 'yes'] %}
-              Safety backup created at: {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}
+              Safety backup created at: {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}
               {% else %}
               Safety backup: SKIPPED by user choice
               {% endif %}
@@ -800,7 +830,7 @@
           1. Wait a few more minutes for containers to fully start
           2. Check container logs: podman logs [container_name]
           3. Restart the LME service: systemctl restart lme
-          4. Check the detailed status file: /tmp/lme_rollback_{{ ansible_date_time.iso8601_basic_short }}.status
+          4. Check the detailed status file: /tmp/lme_rollback_{{ safety_backup_timestamp }}.status
       when: containers_status.rc != 0
       
     - name: Collect rollback results
@@ -811,7 +841,7 @@
       
     - name: Update rollback status file
       copy:
-        dest: "/tmp/lme_rollback_{{ ansible_date_time.iso8601_basic_short }}.status"
+        dest: "/tmp/lme_rollback_{{ safety_backup_timestamp }}.status"
         content: |
           Rollback completed: {{ ansible_date_time.iso8601 }}
           
@@ -820,7 +850,7 @@
           - Stack Version: {{ restored_stack_version }}
           
           {% if backup_choice in ['y', 'yes'] %}
-          Safety backup created at: {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}
+          Safety backup created at: {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}
           {% else %}
           Safety backup: SKIPPED by user choice
           {% endif %}
@@ -847,7 +877,7 @@
           1. Stop the LME service: systemctl stop lme
           2. Remove the failed installation: rm -rf {{ lme_install_dir }}
           {% if backup_choice in ['y', 'yes'] %}
-          3. Restore the safety backup: cp -a {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}/lme/. {{ lme_install_dir }}/
+          3. Restore the safety backup: cp -a {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}/lme/. {{ lme_install_dir }}/
           {% else %}
           3. Restore from an existing backup or reinstall LME
           {% endif %}
@@ -857,7 +887,7 @@
           1. Stop the LME service: systemctl stop lme
           2. Remove the failed installation: rm -rf {{ lme_install_dir }}
           {% if backup_choice in ['y', 'yes'] %}
-          3. Restore the safety backup: cp -a {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}/lme/. {{ lme_install_dir }}/
+          3. Restore the safety backup: cp -a {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}/lme/. {{ lme_install_dir }}/
           {% else %}
           3. Restore from an existing backup or reinstall LME
           {% endif %}
@@ -869,7 +899,7 @@
              a. Remove the current volume: podman volume rm [volume_name]
              b. Create a new volume: podman volume create [volume_name]
           {% if backup_choice in ['y', 'yes'] %}
-             c. Restore from safety backup: cp -a {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}/volumes/[volume_name]/data/. [volume_mountpoint]/
+             c. Restore from safety backup: cp -a {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}/volumes/[volume_name]/data/. [volume_mountpoint]/
           {% else %}
              c. Restore from an existing backup or recreate the volume data
           {% endif %}
@@ -883,7 +913,7 @@
 
           {% if backup_choice in ['y', 'yes'] %}
           Cleanup instructions (after confirming successful rollback):
-          1. Remove the safety backup created during rollback: rm -rf {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}
+          1. Remove the safety backup created during rollback: rm -rf {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}
           {% endif %}
 
     - name: Rollback complete message
@@ -896,7 +926,7 @@
           - Stack Version: {{ restored_stack_version }}
           
           {% if backup_choice in ['y', 'yes'] %}
-          Safety backup created at: {{ backup_base_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}
+          Safety backup created at: {{ backup_base_dir }}/backups/{{ safety_backup_timestamp }}
           {% else %}
           Safety backup: SKIPPED by user choice
           {% endif %}
@@ -913,13 +943,13 @@
           
           Overall status: {{ 'SUCCESS' if install_status == 'Success' and containers_running_status == 'Success' and service_start_result is success else 'PARTIAL - See details above' }}
           
-          A detailed status report has been saved to: /tmp/lme_rollback_{{ ansible_date_time.iso8601_basic_short }}.status
+          A detailed status report has been saved to: /tmp/lme_rollback_{{ safety_backup_timestamp }}.status
 
     - name: Read cleanup instructions from status file
-      command: cat "/tmp/lme_rollback_{{ ansible_date_time.iso8601_basic_short }}.status"
+      command: cat "/tmp/lme_rollback_{{ safety_backup_timestamp }}.status"
       register: status_file
       changed_when: false
 
     - name: Show cleanup instructions
       debug:
-        msg: "{{ dict(range(1, status_file.stdout_lines|length + 1) | zip(status_file.stdout_lines)) }}" 
+        msg: "{{ status_file.stdout_lines }}" 

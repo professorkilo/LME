@@ -3,6 +3,7 @@
 .DS_Store
 /.idea/
 /.vscode/
+/dashboards/exported/
 **/.env
 /Chapter 4 Files/*.dumped.ndjson
 /Chapter 4 Files/exported/
@@ -19,10 +20,10 @@ lme.conf
 /testing/tests/.env
 **/.pytest_cache/
 **/__pycache__/
-/testing/*.password.txt
+/testing/**/*.password.txt
 /testing/configure/azure_scripts/config.ps1
 /testing/configure.zip
-/testing/*.output.log
+/testing/**/*.output.log
 /testing/tests/report.html
 testing/tests/assets/style.css
 .history/
@@ -44,3 +45,15 @@ testing/upgrade_testing/
 .cache/
 .venv/
 *.env
+cloud.md
+
+# SELinux build artifacts
+ansible/roles/base/files/selinux/*.mod
+ansible/roles/base/files/selinux/*.pp
+
+# Offline Install
+offline_resources/
+lme-offline-*.tar.gz
+
+# Development scripts (not for production)
+scripts/dev_uninstall_lme.sh
